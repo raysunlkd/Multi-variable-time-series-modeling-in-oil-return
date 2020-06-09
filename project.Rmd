@@ -1,0 +1,448 @@
+---
+title: "project"
+output: html_document
+autor: 'ZHU Hanfeng'
+---
+
+```{r message=FALSE}
+#load packages
+library(quantmod)
+library(fGarch)
+library(rugarch)
+library(fracdiff)
+library(tseries)
+library(forecast)
+library(urca)
+library(fractal)
+library(MTS)
+```
+
+```{r}
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~Preparation: function used~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+"ccm" <- function(x,lags=12,level=FALSE,output=T){
+  # Compute and plot the cross-correlation matrices.
+  # lags: number of lags used.
+  # level: logical unit for printing.
+  #
+  if(!is.matrix(x))x=as.matrix(x)
+  nT=dim(x)[1]; k=dim(x)[2]
+  if(output){
+    opar <- par(mfcol=c(k,k))
+    on.exit(par(opar))
+  }
+  if(lags < 1)lags=1
+  # remove the sample means
+  y=scale(x,center=TRUE,scale=FALSE)
+  V1=cov(y)
+  if(output){
+    print("Covariance matrix:")
+    print(V1,digits=3) }
+  se=sqrt(diag(V1))
+  SD=diag(1/se)
+  S0=SD%*%V1%*%SD
+  ## S0 used later
+  ksq=k*k
+  wk=matrix(0,ksq,(lags+1))
+  wk[,1]=c(S0)
+  j=0
+  if(output){
+    cat("CCM at lag: ",j,"\n")
+    print(S0,digits=3)
+    cat("Simplified matrix:","\n") }
+  y=y%*%SD
+  crit=2.0/sqrt(nT)
+  for (j in 1:lags){
+    y1=y[1:(nT-j),]
+    y2=y[(j+1):nT,]
+    Sj=t(y2)%*%y1/nT
+    Smtx=matrix(".",k,k)
+    for (ii in 1:k){
+      for (jj in 1:k){
+        if(Sj[ii,jj] > crit)Smtx[ii,jj]="+"
+        if(Sj[ii,jj] < -crit)Smtx[ii,jj]="-"
+      } }#
+    if(output){
+      cat("CCM at lag: ",j,"\n")
+      for (ii in 1:k){
+        cat(Smtx[ii,],"\n") }
+      if(level){
+        cat("Correlations:","\n")
+        print(Sj,digits=3) }
+      ## end of if-(output) statement
+    }
+    wk[,(j+1)]=c(Sj)
+  }
+  ##
+  if(output){
+    iik <- rep(1:k, k)
+    jjk <- rep(1:k, each=k)
+    tdx=c(0,1:lags)
+    jcnt=0
+    if(k > 10){
+      print("Skip the plots due to high dimension!") } else {
+        for (j in 1:ksq){
+          plot(tdx, wk[j,], type='h',
+               xlab='lag',
+               ylab=paste('ccf(', iik[j], ",", jjk[j], ")"),
+               ylim=c(-1,1))
+          abline(h=c(0))
+          crit=2/sqrt(nT)
+          abline(h=c(crit),lty=2)
+          abline(h=c(-crit),lty=2)
+          jcnt=jcnt+1 } }
+    ## end of if-(output) statement
+  }
+  ## The following p-value plot was added on May 16, 2012 by Ruey Tsay.
+  ### Obtain a p-value plot of ccm matrix
+  r0i=solve(S0)
+  R0=kronecker(r0i,r0i)
+  pv=rep(0,lags)
+  for (i in 1:lags){
+    tmp=matrix(wk[,(i+1)],ksq,1)
+    tmp1=R0%*%tmp
+    ci=crossprod(tmp,tmp1)*nT*nT/(nT-i)
+    pv[i]=1-pchisq(ci,ksq)
+  }
+  if(output){
+    par(opar)
+    plot(pv,xlab='lag',ylab='p-value',ylim=c(0,1))
+    abline(h=c(0))
+    abline(h=c(0.05),col="blue")
+    title(main="Significance plot of CCM") }
+  ccm <- list(ccm=wk,pvalue=pv)
+}
+```
+
+
+```{r warning=FALSE}
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~Part1: Obtain the data~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+#Obtain the 0857.hk(涓浗鐭虫补鑲′唤) stock data from 2013.1.1 to 2020.1.1
+setSymbolLookup(ZHMQ=list(name='0857.hk',src='yahoo'))
+getSymbols("ZHMQ", from='2013-01-01',to='2020-01-01')
+
+#plot the daily price graph
+chartSeries(ZHMQ)
+
+
+#compute the log return of the adjusted price
+ZHMQ_return=diff(log(ZHMQ$`0857.HK.Adjusted`))
+ZHMQ_return[is.na(ZHMQ_return)]<-0
+
+
+#plot the time series graph of the ZGYH log return
+x=ts(ZHMQ_return, start = c(2013, 1,1), end = c(2020,1, 1),frequency =252 )
+plot.ts(x,xlab="date",ylab="Log Return",col="blue")
+title(main="The log return of ZHMQ from 2013 to 2020")
+
+```
+
+
+```{r}
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~Part2: data test~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+#2.1 do the ADF test to determine if the time series is stationary.
+adf.test(ZHMQ_return)
+#results: As  P-values are smaller than 0.01, the log return series are stationary.
+
+# LjunggBox Test
+Box.test(ZHMQ_return,lag=10,type="Ljung")
+#Q(10) = 20.027 with a p-value of 0.029 which means that we will reject H0 and that there exists serial correlation
+
+
+#2.2 plot the ACF and PACF
+acf(ZHMQ_return,lag.max =14,main='ACF of log_return ',ylim=c(-0.15,0.15))
+pacf(ZHMQ_return,lag.max=14,main="PACF of log_return",ylim=c(-0.15,0.15))
+
+```
+
+```{r}
+#~~~~~~~~~~~~~~~~~~~~Part3:Model constuction on return and checking~~~~~~~~~~~~~~~~~~~~~
+#3.1 ARIMA model
+
+#based on the graph of ACF and PACF we choose the ARIMA(1,0,1) to fit the model
+est=arima(ZHMQ_return, c(1, 0, 1))
+est
+# Perform model checking using Q(12) for residuals.
+Box.test(est$residuals,lag=10,type="Ljung")
+#As P values is 0.23, ARIMA model is enough but it is not a very good model.
+
+#3.2 Checking ARCH effect
+#As there is a strong correlation in the log returns, we first consider fit an AR (1) model to the log return in order to remove the serial correlation and then do the test of ARCH effect
+ar1=arima(ZHMQ_return,order=c(1,0,0))
+Box.test(ar1$residuals**2,lag=10,type="Ljung")
+Box.test(ZHMQ_return^2,lag=10,type="Ljung")
+# Q(10at^2)= 289.27, with a p-value near zero. Therefore, we reject H0 that all ACF are zero. As a result, there is ARCH effect.
+
+
+#3.3 ARMA-GARCH Model Fitting and Checking
+
+#(1). ARMA(1,1)GARCH(1,1) Model
+m1=garchFit(intc~arma(1,1)+garch(1,1),data=ZHMQ_return,cond.dist='norm',trace=F)
+summary(m1) # output edited.
+#From the output we find the AIC of this model is -5.445
+
+#(2).AR(1)GARCH(1,1) Model
+m2=garchFit(intc~arma(1,0)+garch(1,1),data=ZHMQ_return,trace=F)
+summary(m2) # output edited.
+#From the output we find the AIC of this model is -5.446
+
+#(3).ARMA(2,2)GARCH(1,1) Model
+m3=garchFit(intc~arma(2,2)+garch(1,1),data=ZHMQ_return,trace=F)
+summary(m3) # output edited.
+#From the output we find the AIC of this model is -5.444,Log Likelihood:4701.832
+
+#(4) ARMA(1,1)IGARCH(1,1) Model
+m4=ugarchspec(variance.model=list(model="iGARCH",garchOrder = c(1, 1)),
+              mean.model=list(armaOrder=c(1,1),include.mean = TRUE) )
+m4=ugarchfit(spec=m4,data=ZHMQ_return)
+m4
+#Log Likelihood:4697.859
+
+#(5) ARMA(1,1)eGARCH(1,1) Model
+spec=ugarchspec(variance.model=list(model="eGARCH",garchOrder=c(1,1)),
+                mean.model=list(armaOrder=c(1,1),include.mean = TRUE) )
+m5=ugarchfit(spec=spec,data=ZHMQ_return)
+m5 
+### see output
+
+#Based on the aic value,here we choose to use the AR(1)GARCH(1,1) Model 
+#From the output we find Q(10,residual) = 10.66, with a p-value of 0.38, and Q(10,redisual^2) =14.91, with a p-value of 0.14. However, the Normality assumption may not be valid since the Jarque-Bera Test has a p-value near zero.
+#Compare to the original ARIMA(1,0,1), the P value of the residual is larger in the AR(1)GARCH(1,1) so we can say that AR(1)GARCH(1,1) performs better.
+
+#Compute n-step ahead forecasts for the log return and its n-step forecasting interval.
+#5.1 forecast the return
+forecast=predict(m2,1)
+forecast
+
+```
+
+
+```{r}
+#~~~~~~~~~~~~~Part4:Model constuction on return volatility and checking~~~~~~~~~~~~~~~~~
+#4.1 data process
+vw <- abs(ZHMQ_return)
+
+#do the ADF test to determine if the time series is stationary.
+adf.test(vw)
+#results: As  P-values are smaller than 0.01, the log return series are stationary.
+
+# LjunggBox Test
+Box.test(vw,lag=10,type="Ljung")
+
+#4.2 long memory test
+acf(vw, main="ACF of log_return volatility", lag.max=35,ylim=c(0,0.35))
+pacf(vw, main="PACF of log_return volatility", lag.max=35,ylim=c(0,0.35))
+# the ACF of the absoulate log return converge to 0 slowly and always positive so this series has the long-memory porperty.
+
+#test the long-memory effect
+hurstSpec(vw)
+
+# use the package fracdiff to compute the d
+fdGPH(vw)
+#here we compute the d is almost 0.4759
+
+#4.3 AFRIMA(p,d,q)model
+m6<-fracdiff(vw,nar=1,nma=1)
+summary(m6)
+#the fitted model is:
+#(1-0.3410B)(1-B)^0.3351Xt = 蔚t-0.5945蔚t-1, 蟽蔚 = 0.0112527
+Box.test(m6$residuals,lag=10,type="Ljung")
+
+# 4.4 AFRIMA(p,d,q) GARCH model
+#do the ARCH test
+Box.test(m6$residuals^2,lag=10,type="Ljung")
+#the residual still have the ARCH effect so we use the GARCH model to do fit the residual
+m7=garchFit(intc~garch(1,1),data=m6$residuals,trace=F)
+summary(m7) # output edited.
+
+#From the output we find Q(10,residual) = 8.276, with a p-value of 0.60
+#4.5 Forecast
+predict(m6,1)
+
+```
+
+```{r}
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~Part5.1:VAR model~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+#Obtain the 00857.hk(PetroChina) stock data from 2013.1.1 to 2020.1.1
+setSymbolLookup(ZHMQ=list(name='0857.hk',src='yahoo'))
+getSymbols("ZHMQ", from='2013-01-01',to='2020-01-01')
+
+
+#plot the daily price graph
+chartSeries(ZHMQ)
+x<-ZHMQ$`0857.HK.Adjusted`
+names(x)<-'PetroChina'
+#compute the log return of the close price
+ZHMQ_return=diff(log(x))
+ZHMQ_return<-ZHMQ_return[-1]
+x1<-ZHMQ_return
+
+#Obtain the 00883.hk(中国海洋石油) stock data from 2013.1.1 to 2020.1.1
+setSymbolLookup(ZHMQ=list(name='0883.hk',src='yahoo'))
+getSymbols("ZHMQ", from='2013-01-01',to='2020-01-01')
+
+
+#plot the daily price graph
+chartSeries(ZHMQ)
+x<-ZHMQ$`0883.HK.Adjusted`
+names(x)<-'CNOOC'
+#compute the log return of the close price
+ZHMQ_return=diff(log(x))
+ZHMQ_return<-ZHMQ_return[-1]
+x2<-ZHMQ_return
+
+s857=ts(x1, start = c(2013, 1,1), end = c(2020,1, 1),frequency =252 )
+s883=ts(x2, start = c(2013, 1,1), end = c(2020,1, 1),frequency =252 )
+
+#Plot the scater graph for the returns of 00883.hk and 00857.hk
+plot(c(s857), c(s883), xlab=" PetroChina[t]", ylab="CNOOC[t]")
+
+#Compute the correlation of the two stocks.
+cor.test(c(s857), c(s883))
+#The correlation coefficient at the same time is 0.746, significant.
+
+#CNOOC vs. one step behind PetroChina
+plot(c(s857)[-length(s883)], c(s883)[-1],
+     xlab=" PetroChina[t-1]", ylab="CNOOC[t]")
+
+cor.test(c(s857)[-length(s883)], c(s883)[-1])
+#Correlation is too small.
+
+#PetroChina vs. one step behind CNOOC
+plot(c(s883)[-length(s857)], c(s857)[-1],
+     xlab="CNOOC[t-1]", ylab="PetroChina[t]")
+cor.test(c(s883)[-length(s857)], c(s857)[-1])
+#Correlation is also small but larger than the former one.
+```
+
+
+```{r}
+#Drawing time series diagram with MTSslot() function of MTS package
+MTS::MTSplot(cbind(s857, s883))
+
+#Calculate the simple sample statistics of two sequences：
+PetroChina<-s857
+CNOOC<-s883
+fBasics::basicStats(cbind(PetroChina, CNOOC))
+#According to the kurtosis, the heavy tail distributions of the two sequences are obvious and CNOOC has a more obvious heavy tail distribution.
+
+# Sample Cross-Correlation Matrices
+ccm(cbind(s857, s883))
+
+#结果中给出了 rt 的协方差阵估计，即 ??0；给出了 rt 的相关阵估计，即 ρ??0；随后给出了 l = 1, 2, . . . 的
+#CCM(即 ρ??l) 的简化表示。两个序列的同步的相关性较强，相关系数为 0.746；中国石油股份对数收益率的序列自相
+#关（矩阵的左上角元素）都不显著；中国海洋石油对数收益率的序列自相关（矩阵的右下角元素）在滞后0之后的
+#位置均不显著；中国石油股份受中国海洋石油过去值的影响（矩阵的右上角元素）只在滞后0位置显著；中国海洋石油受
+#中国石油股份过去值的影响（矩阵的左下角元素）都不显著。这符合一般的常识。
+#在上面的四幅小图中，左上图是中国石油股份对数收益率的 ACF，右下图是中国海洋石油 对数收益率的 ACF；右上图
+#是 ρ12(l) = corr(x1t, x2,t l), l = 0, 1, 2, . . . 的图形，即 t 时刻 中国石油股份 对数收益率与滞后的 t l 时刻
+#的中国海洋石油对数收益率之间的相关系数图，因为时间的单向性可以看成是中国海洋石油对中国石油股份过去值的股票的领先作用。
+#左下图是中国海洋石油对数收益率与滞后的中国石油股份收益率的相关系数图，可以看成是中国石油股份股票对中国海洋石油的领先作用。
+#虽然文本显示的 ρ??l 矩阵有正负号，但是从图形来看除了同步情形以外自相关和互相关都比较弱,同步时的互相关是显著
+#的。中国海洋石油对中国石油股份有很弱的领先作用，而中国石油股份对中国海洋石油没有领先作用
+#
+```
+
+
+```{r}
+MTS::mq(cbind(s857, s883), lag=12)
+#上面的程序对 m = 1, 2, . . . , 12 分别计算了检验，并做了 p 值随 m 变化的图形。在 0.05 水平下都是显著的。
+
+#Qk(m) 统计量是对 rt 的前 m 个互相关阵的一个联合检验，如果结果显著，就应该建立多元的均值模型描
+#述序列分量之间的领先–滞后关系。最常用的是向量自回归 (VAR) 模型。
+
+#两个股票的收盘价的对数收益率的时间序列图：
+x<-ts(as.matrix(merge(x1, x2)), start = c(2013, 1,1), end = c(2020,1, 1),frequency =252 )
+
+plot(x, type="l",
+     multi.panel=TRUE, theme="white",
+     main="PetroChina,CNOOC daily log returns",
+     major.ticks="days",
+     grid.ticks.on = "days")
+
+#MTS 包的 VAR() 函数估计 VAR(1) 模型：
+Z <- coredata(x)
+m1 <- VAR(Z, 1)
+
+#估计 VAR(2) 模型：
+Z <- coredata(x)
+m2 <- VAR(Z, 2)
+
+#VAR(1) 的 AIC 为 -16.8695，VAR(2) 的 AIC 为 -16.8684, VAR(1)占优
+
+
+#利用 MTS 包的 VARorder 函数可以计算 VAR 定阶的 M(i) 统计量检验和各种信息准则：
+Z <- coredata(x)
+m_3 <- VARorder(Z)
+#从 AIC 比较来看，应该取 p = 1。从检验来看，从 p = 2 阶开始 Φi 就不显著了，但 Φ1显著，所以
+#应该取 p = 1 阶。
+
+#计算模型残差，对残差进行多元白噪声检验（多元混成检验）。残差的多元混成检验因为使用了估计的
+#参数，所以统计量的自由度会减少 k2p，这是系数矩阵 Φj , j = 1, 2, . . . , p 中的参数个数。如果系数矩阵中
+#某些参数固定为 0，应按无约束的参数个数计算要扣除的自由度。在 MTS 包的 mq() 函数中用 adj= 指定
+#需要减少的自由度。
+resi <- m1$residuals
+mq(resi, adj=2^2 * 1)
+MTSdiag(m1, gof = 8, adj = 0, level = F)
+VARpred(m1, h = 5, orig = 0, Out.level = F)
+
+#检验结果只有在滞后15显著，基本可以认为模型是充分的（残差项基本是白噪声）。
+```
+
+```{r}
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~Part5.2:Bekk-Garch and DCC-Garch model~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+#Bekk(1,1) model
+m1a=BEKK11(x)
+
+names(m1a)
+Sigma.t=m1a$Sigma.t
+
+# Remove conditional means
+at=cbind(x[,1]-0.00776,x[,2]-0.00565) 
+
+MCHdiag(at,Sigma.t)
+
+
+```
+
+
+```{r}
+#DCC-Garch model
+#Procedure for Building DCC Models
+#A commonly used procedure to build DCC models is given next:
+#1. Use a VAR(p) model, if necessary, to obtain estimates of the condition mean
+#μ??t for the return series zt and let a??t = zt ??? μ??t be the residual series.
+#2. Apply univariate volatility models, for example, GARCH models, to each component series a??it. Let the volatility series be h??it and treat h??it as an estimate of
+#σii,t. That is, σ??ii,t = h??it.
+#3. Standardize the innovations via η??it = ??ait/σ??ii,t and fit a DCC model to η??t.
+#The conditional distribution of ηt can either be multivariate standard normal or
+#multivariate standard Student-t with v degrees of freedom. See Equation (7.3).
+
+
+#Dcc model:VAR(1)-DCC-GARCH model
+#Dcc model step 1
+m1=dccPre(x,include.mean=T,p=1)
+
+#Dcc model step 2
+names(m1)
+rtn1=m1$sresi
+Vol=m1$marVol
+
+#Dcc model step 3
+m2=dccFit(rtn1)
+names(m2)
+S2.t = m2$rho.t
+
+m3=dccFit(rtn1,type="Engle")
+S3.t=m3$rho.t
+
+#Test 
+MCHdiag(rtn1,S2.t)
+MCHdiag(rtn1,S3.t)
+```
+
+
